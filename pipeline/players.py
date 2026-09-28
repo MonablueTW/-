@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from court import HALF_L, HALF_W, Camera
+from court import Camera, Sport
 
 L_ANKLE, R_ANKLE, L_SH, R_SH, L_HIP, R_HIP = 15, 16, 5, 6, 11, 12
 
@@ -37,12 +37,13 @@ def overlap(a: np.ndarray, b: np.ndarray) -> float:
 class PoseDetector:
     """整張畫面跑一次 YOLO pose；遠場的人很小，再把遠半場放大跑第二次。"""
 
-    def __init__(self, cam: Camera, model: str = "yolo11m-pose.pt", imgsz: int = 960, conf: float = 0.25,
-                 device: str | None = None, far_zoom: bool = True):
+    def __init__(self, cam: Camera, sport: Sport, model: str = "yolo11m-pose.pt", imgsz: int = 960,
+                 conf: float = 0.25, device: str | None = None, far_zoom: bool = True):
         from ultralytics import YOLO
 
         self.model = YOLO(model)
         self.cam = cam
+        self.sport = sport
         self.imgsz = imgsz
         self.conf = conf
         self.device = device
@@ -50,7 +51,10 @@ class PoseDetector:
         self.roi_imgsz = self._roi_imgsz() if self.far_roi else imgsz
 
     def _far_roi(self):
-        xs, zs, ys = (-HALF_W - 1.5, HALF_W + 1.5), (-HALF_L - 3.0, 0.3), (0.0, 2.1)
+        sp = self.sport
+        mx, mz = sp.player_margin
+        xs = (-sp.half_width - 0.6 * mx, sp.half_width + 0.6 * mx)
+        zs, ys = (-sp.half_length - 0.86 * mz, 0.3), (0.0, 2.1)
         pts = np.array([[x, y, z] for x in xs for y in ys for z in zs])
         depth = (pts @ self.cam.R.T + self.cam.t)[:, 2]
         if np.any(depth <= 0):
@@ -66,7 +70,7 @@ class PoseDetector:
 
     def _roi_imgsz(self, target_px: float = 200) -> int:
         """放大倍率：讓站在遠端底線後方的人，在模型輸入裡大約 target_px 像素高（太小 YOLO 會抓不到）。"""
-        z = -HALF_L - 1.5
+        z = -self.sport.half_length - 0.43 * self.sport.player_margin[1]
         top, bottom = self.cam.project(np.array([[0, 1.75, z], [0, 0.0, z]]))
         person_px = max(8.0, abs(bottom[1] - top[1]))
         x0, y0, x1, y1 = self.far_roi
@@ -129,7 +133,8 @@ class PoseDetector:
             g = self.cam.ground_points(np.array([[(d.box[0] + d.box[2]) / 2, d.box[3]]]))[0]
         if not np.all(np.isfinite(g)):
             return False
-        if abs(g[0]) > HALF_W + 2.5 or abs(g[2]) > HALF_L + 3.5:
+        mx, mz = self.sport.player_margin
+        if abs(g[0]) > self.sport.half_width + mx or abs(g[2]) > self.sport.half_length + mz:
             return False
         # 框的高度要像一個站在那裡的人（排除太小或太大的誤判）
         top, bottom = self.cam.project(np.array([[g[0], 1.75, g[2]], [g[0], 0.0, g[2]]]))
@@ -149,7 +154,7 @@ def pixel_colors(hsv: np.ndarray) -> np.ndarray:
     h, s, v = hsv[:, 0].astype(int), hsv[:, 1].astype(int), hsv[:, 2].astype(int)
     hue = np.select([(h < 8) | (h >= 170), h < 20, h < 34, h < 85, h < 100, h < 130, h < 150], [3, 4, 5, 6, 7, 8, 9], 10)
     white = (s < 50) | ((v > 195) & (s < 110))
-    return np.select([v < 75, white & (v > 150), white], [0, 1, 2], hue)
+    return np.select([v < 90, white & (v > 150), white], [0, 1, 2], hue)
 
 
 def appearance(frame: np.ndarray, d: Detection):
@@ -192,26 +197,28 @@ class Slot:
 
 
 class PlayerTracker:
-    """把每一格的偵測分配給固定的 4 個位置：近場 ×2、遠場 ×2（左右依攝影機看過去）。"""
+    """把每一格的偵測分配給固定的球員：近場 per_side 人、遠場 per_side 人（雙打 2、單打 1）。"""
 
-    def __init__(self, fps: float):
+    def __init__(self, fps: float, per_side: int = 2):
         self.fps = fps
-        self.slots = [Slot("near"), Slot("near"), Slot("far"), Slot("far")]
+        self.per_side = per_side
+        self.slots = [Slot("near") for _ in range(per_side)] + [Slot("far") for _ in range(per_side)]
 
     def assign(self, f: int, dets: list[Detection]) -> list[Detection | None]:
         """位置（離上次多遠）＋ 外觀（衣服顏色分布）一起比對。消失越久，位置越不重要、顏色越重要。"""
-        out: list[Detection | None] = [None] * 4
-        for side, idx in (("near", (0, 1)), ("far", (2, 3))):
-            cands = [d for d in dets if (d.ground[1] > 0) == (side == "near")][:4]
+        n = self.per_side
+        out: list[Detection | None] = [None] * len(self.slots)
+        for side, idx in (("near", range(n)), ("far", range(n, 2 * n))):
+            cands = [d for d in dets if (d.ground[1] > 0) == (side == "near")][: 2 * n]
             if not cands:
                 continue
-            cost = np.full((2, len(cands)), 1e6)
+            cost = np.full((n, len(cands)), 1e6)
             for a, si in enumerate(idx):
                 s = self.slots[si]
                 for b, d in enumerate(cands):
                     if s.pos is None:
                         if d.conf >= 0.4:  # 第一次出現要夠確定（避免把場邊觀眾當成球員）
-                            order = d.ground[0] if a == 0 else -d.ground[0]  # 左邊的給第一格
+                            order = 0.0 if n == 1 else (d.ground[0] if a == 0 else -d.ground[0])  # 左邊的給第一格
                             cost[a, b] = 5.0 + 0.1 * order
                         continue
                     gap = (f - s.last) / self.fps
@@ -269,7 +276,8 @@ class PlayerTracker:
         for s in self.slots:
             c = color_name(np.sum(s.colors, 0)) if s.colors else "?"
             names.append(f"{'近場' if s.side == 'near' else '遠場'}·{c}衣")
-        for i, j in ((0, 1), (2, 3)):  # 同一邊兩人同色 → 加左右
+        n = self.per_side
+        for i, j in ((0, 1), (2, 3)) if n == 2 else ():  # 同一邊兩人同色 → 加左右
             if names[i] == names[j]:
                 left_first = np.mean(self.slots[i].xs or [0]) <= np.mean(self.slots[j].xs or [0])
                 names[i] += "（左）" if left_first else "（右）"

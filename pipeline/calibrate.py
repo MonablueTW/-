@@ -6,8 +6,8 @@
   2. python calibrate.py --points points.json --video 你的影片.mp4 --out calib.json
      會印出誤差，並輸出一張 calib_preview.jpg（黃線 = 用算出來的相機畫回去的球場線，應該和真實的線重疊）。
 
-至少要 4 個「地面上」的點（例如近端底線兩角＋近端廚房線兩端）；點越多、分布越開越準。
-攝影機必須是固定的（不能跟拍轉動或變焦）。
+至少要 4 個「地面上」的點（例如近端底線兩角＋近端發球線／廚房線兩端）；點越多、分布越開越準。
+攝影機必須是固定的（不能跟拍轉動或變焦）。支援網球和匹克球（points.json 裡的 sport 欄位）。
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 from scipy.optimize import least_squares
 
-from court import KEYPOINT_LABELS, KEYPOINTS, Camera, draw_court
+from court import SPORTS, Camera, Sport, draw_court, get_sport
 
 
 def focal_from_homography(obj_xz: np.ndarray, img_uv: np.ndarray, cx: float, cy: float) -> float | None:
@@ -38,7 +38,17 @@ def focal_from_homography(obj_xz: np.ndarray, img_uv: np.ndarray, cx: float, cy:
     return float(np.sqrt(np.median(cands))) if cands else None
 
 
-def solve(points: dict[str, list[float]], width: int, height: int, fit_k1: bool | None = None):
+def infer_sport(points: dict) -> str:
+    """沒寫球種時，從點的名稱猜（發球線 → 網球，廚房線 → 匹克球）。"""
+    scores = {k: sum(n in sp.keypoints for n in points) - sum(n not in sp.keypoints for n in points)
+              for k, sp in SPORTS.items()}
+    return max(scores, key=scores.get)
+
+
+def solve(points: dict[str, list[float]], width: int, height: int, fit_k1: bool | None = None,
+          sport: Sport | None = None):
+    sport = sport or get_sport(infer_sport(points))
+    KEYPOINTS = sport.keypoints
     names = [n for n in points if n in KEYPOINTS and points[n] is not None]
     unknown = [n for n in points if n not in KEYPOINTS]
     if unknown:
@@ -113,6 +123,7 @@ def main():
     ap.add_argument("--out", default="calib.json")
     ap.add_argument("--preview", default=None, help="預覽圖路徑（預設：和 --out 同名 _preview.jpg）")
     ap.add_argument("--k1", choices=["auto", "on", "off"], default="auto", help="是否估計鏡頭變形")
+    ap.add_argument("--sport", choices=list(SPORTS), default=None, help="球種（預設讀 points.json）")
     args = ap.parse_args()
 
     with open(args.points, encoding="utf-8") as f:
@@ -120,19 +131,22 @@ def main():
     points = data["points"]
     width, height = int(data["width"]), int(data["height"])
     fit_k1 = {"auto": None, "on": True, "off": False}[args.k1]
+    sport = get_sport(args.sport or data.get("sport") or infer_sport(points))
+    print(f"球種：{sport.name}")
 
-    cam, rms, errors = solve(points, width, height, fit_k1)
+    cam, rms, errors = solve(points, width, height, fit_k1, sport)
     C = cam.center
     fov = np.degrees(2 * np.arctan(width / (2 * cam.K[0, 0])))
     print(f"重投影誤差 RMS = {rms:.2f} px（< 3 px 算好，> 8 px 請檢查點）")
     for n, e in sorted(errors.items(), key=lambda kv: -kv[1]):
         flag = "  ← 偏大" if e > max(6, 2.5 * rms) else ""
-        print(f"  {KEYPOINT_LABELS[n]:<10s} {e:6.2f} px{flag}")
+        print(f"  {sport.labels[n]:<12s} {e:6.2f} px{flag}")
     print(f"相機位置 x={C[0]:.2f} y(高度)={C[1]:.2f} z={C[2]:.2f} m，水平視角 {fov:.1f}°，k1={cam.dist[0]:.3f}")
     if C[2] < 0:
         print("⚠ 相機在遠端那一側：near / far 可能標反了。", file=sys.stderr)
 
     out = {
+        "sport": sport.id,
         "camera": cam.to_json(),
         "rms": round(rms, 3),
         "errors": {k: round(v, 2) for k, v in errors.items()},
@@ -147,8 +161,8 @@ def main():
     if frame is not None:
         if frame.shape[1] != width or frame.shape[0] != height:
             frame = cv2.resize(frame, (width, height))
-        prev = draw_court(frame, cam, (0, 230, 255), 2)
-        proj = dict(zip(errors, cam.project(np.array([KEYPOINTS[n] for n in errors]))))
+        prev = draw_court(frame, cam, sport, (0, 230, 255), 2)
+        proj = dict(zip(errors, cam.project(np.array([sport.keypoints[n] for n in errors]))))
         for n, uv in proj.items():
             p = tuple(int(round(x)) for x in points[n])
             q = tuple(int(round(x)) for x in uv)

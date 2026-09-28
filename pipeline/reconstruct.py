@@ -1,4 +1,4 @@
-"""影片 → 3D 重建資料（網頁 viewer 讀的 JSON）＋ 網頁用的影片檔。
+"""影片 → 3D 重建資料（網頁 viewer 讀的 JSON）＋ 網頁用的影片檔。支援網球與匹克球。
 
 用法：
   python reconstruct.py 你的影片.mp4 --calib calib.json --out ../web/data/rally1.json --start 12 --end 40
@@ -22,7 +22,7 @@ import numpy as np
 from scipy.signal import savgol_filter
 
 from ball import BallDetector, reconstruct_ball, remove_people
-from court import Camera
+from court import SPORTS, Camera, CourtViewCheck, get_sport
 from lifting import JOINTS, J, MediaPipeLifter, lift_bone_lengths, lift_mediapipe
 from players import PlayerTracker, PoseDetector
 
@@ -106,13 +106,15 @@ def smooth_track(arr: np.ndarray, max_gap: int, root_window: int, pose_window: i
     return out
 
 
-def detect_all(args, cap, cam: Camera, fps: float, W: int, H: int, first: int, last: int, video_path: Path) -> dict:
+def detect_all(args, cap, cam: Camera, sport, per_side: int, fps: float, W: int, H: int, first: int, last: int,
+               video_path: Path) -> dict:
     """逐格跑偵測與 3D 推算（最花時間的部分）。"""
-    detector = PoseDetector(cam, args.model, args.imgsz, device=args.device, far_zoom=not args.no_far_zoom)
+    detector = PoseDetector(cam, sport, args.model, args.imgsz, device=args.device, far_zoom=not args.no_far_zoom)
     if detector.far_roi:
         x0, y0, x1, y1 = (int(v) for v in detector.far_roi)
         print(f"遠半場放大偵測：範圍 ({x0},{y0})–({x1},{y1})，輸入尺寸 {detector.roi_imgsz}")
-    tracker = PlayerTracker(fps / args.stride)
+    tracker = PlayerTracker(fps / args.stride, per_side)
+    view_check = CourtViewCheck(cam, sport)
     lifter = None
     if args.mediapipe != "off":
         try:
@@ -123,10 +125,12 @@ def detect_all(args, cap, cam: Camera, fps: float, W: int, H: int, first: int, l
     ball = None if args.no_ball else BallDetector(cam, hsv[:3], hsv[3:])
     writer = None if args.no_video else VideoWriter(str(video_path), W, H, fps, args.max_width)
 
+    n_players = 2 * per_side
     n_out = (last - first) // args.stride + 1
-    poses = np.full((4, n_out, len(JOINTS), 3), np.nan)
-    conf = np.zeros((4, n_out))
-    methods = np.zeros((4, n_out), np.int8)  # 1 = MediaPipe, 2 = 骨長法
+    poses = np.full((n_players, n_out, len(JOINTS), 3), np.nan)
+    conf = np.zeros((n_players, n_out))
+    methods = np.zeros((n_players, n_out), np.int8)  # 1 = MediaPipe, 2 = 骨長法
+    other_view: set[int] = set()  # 不是校正機位的影格（重播、特寫…）
     ball_cands: dict[int, list] = {}
     anchors: dict[int, list] = {}  # 影格 → [(手腕 2D, 球員編號, 資料格, 框高)]，給球的軌跡當參考
     person_boxes: dict[int, list] = {}  # 影格 → 所有人的框（去除球的誤判用）
@@ -140,7 +144,10 @@ def detect_all(args, cap, cam: Camera, fps: float, W: int, H: int, first: int, l
         if writer:
             writer.write(frame)
         k = f - first
-        if k % args.stride == 0:
+        on_court = view_check(frame) >= 0.18
+        if not on_court:
+            other_view.add(f)
+        if k % args.stride == 0 and on_court:
             i = k // args.stride
             dets = detector(frame)
             person_boxes[f] = [d.box.tolist() for d in dets]
@@ -148,7 +155,7 @@ def detect_all(args, cap, cam: Camera, fps: float, W: int, H: int, first: int, l
             for p, d in enumerate(assigned):
                 if d is None:
                     continue
-                facing = np.array([0.0, 0.0, -1.0 if p < 2 else 1.0])
+                facing = np.array([0.0, 0.0, -1.0 if p < per_side else 1.0])
                 joints, method = None, 0
                 if lifter:
                     res = lifter.detect(frame, d.box, d.kpts)
@@ -162,7 +169,7 @@ def detect_all(args, cap, cam: Camera, fps: float, W: int, H: int, first: int, l
                 anchors.setdefault(f, []).append((d.kpts[[9, 10], :2], p, i, d.box[3] - d.box[1]))
         if ball:
             r = ball.push(f, frame)
-            if r and r[1]:
+            if r and r[1] and r[0] not in other_view:
                 ball_cands[r[0]] = r[1]
         if (k + 1) % 30 == 0:
             el = time.time() - t_start
@@ -173,9 +180,13 @@ def detect_all(args, cap, cam: Camera, fps: float, W: int, H: int, first: int, l
     if lifter:
         lifter.close()
     n_out = (last - first) // args.stride + 1
+    if other_view:
+        print(f"跳過 {len(other_view)} 格不是校正機位的畫面（重播、特寫或攝影機移動）")
     return {
         "first": first,
         "last": last,
+        "sport": sport.id,
+        "other_view": sorted(other_view),
         "poses": poses[:, :n_out],
         "conf": conf[:, :n_out],
         "methods": methods[:, :n_out],
@@ -189,9 +200,12 @@ def detect_all(args, cap, cam: Camera, fps: float, W: int, H: int, first: int, l
 
 
 def main():
-    ap = argparse.ArgumentParser(description="匹克球影片 → 3D 重建 JSON")
+    ap = argparse.ArgumentParser(description="網球／匹克球影片 → 3D 重建 JSON")
     ap.add_argument("video")
     ap.add_argument("--calib", required=True, help="calibrate.py 產生的 calib.json")
+    ap.add_argument("--sport", choices=list(SPORTS), default=None, help="球種（預設讀 calib.json）")
+    ap.add_argument("--players-per-side", type=int, choices=[1, 2], default=None,
+                    help="每邊幾個人：網球單打 1、雙打 2（預設依球種）")
     ap.add_argument("--out", required=True, help="輸出的 JSON，例如 ../web/data/rally1.json")
     ap.add_argument("--start", type=float, default=0, help="從第幾秒開始")
     ap.add_argument("--end", type=float, default=None, help="到第幾秒結束（預設到影片結尾）")
@@ -217,6 +231,9 @@ def main():
     W, H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cam = Camera.load(args.calib)
+    with open(args.calib, encoding="utf-8") as fh:
+        sport = get_sport(args.sport or json.load(fh).get("sport", "pickleball"))
+    per_side = args.players_per_side or sport.players_per_side
     if (cam.width, cam.height) != (W, H):
         if abs(cam.width / cam.height - W / H) > 0.01:
             raise SystemExit(f"校正時的畫面比例 {cam.width}x{cam.height} 和影片 {W}x{H} 不同")
@@ -232,7 +249,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     video_path = out_path.with_suffix(".mp4")
 
-    print(f"影片 {W}x{H} @ {fps:.2f}fps，處理第 {first}–{last} 格（{(last - first + 1) / fps:.1f} 秒）")
+    print(f"{sport.name}（每邊 {per_side} 人）｜影片 {W}x{H} @ {fps:.2f}fps，處理第 {first}–{last} 格（{(last - first + 1) / fps:.1f} 秒）")
     # 偵測是最花時間的步驟，結果存成快取；只想調整後處理（例如球的參數）時加 --reuse 就不用重跑
     cache_path = Path(args.video).with_name(f"{Path(args.video).stem}.{first}-{last}.s{args.stride}.pk3d.pkl")
     if args.reuse and cache_path.exists():
@@ -240,7 +257,7 @@ def main():
             raw = pickle.load(fh)
         print(f"使用快取 {cache_path}")
     else:
-        raw = detect_all(args, cap, cam, fps, W, H, first, last, video_path)
+        raw = detect_all(args, cap, cam, sport, per_side, fps, W, H, first, last, video_path)
         with open(cache_path, "wb") as fh:
             pickle.dump(raw, fh)
     cap.release()
@@ -249,7 +266,8 @@ def main():
     poses, conf, methods = raw["poses"], raw["conf"], raw["methods"]
     n_out = poses.shape[1]
     fps_out = fps / args.stride
-    for p in range(4):
+    n_players = poses.shape[0]
+    for p in range(n_players):
         poses[p] = smooth_track(poses[p], max_gap=int(0.4 * fps_out), root_window=int(fps_out * 0.5) | 1,
                                 pose_window=max(5, int(fps_out * 0.2) | 1))
 
@@ -259,7 +277,7 @@ def main():
         for f, items in raw["anchors"].items():
             wrist_anchor[f] = [(uv, poses[p, i][WRIST], h) for uv, p, i, h in items]
         cands = remove_people(raw["ball_cands"], raw.get("person_boxes", {}))
-        pos = reconstruct_ball(cam, cands, fps, first, last, wrist_anchor)
+        pos = reconstruct_ball(cam, cands, fps, first, last, sport, wrist_anchor)
         for f, x in pos.items():
             k = f - first
             if k % args.stride == 0 and 0 <= k // args.stride < n_out:
@@ -272,7 +290,7 @@ def main():
     if not args.no_video and not has_video:
         print(f"⚠ 找不到 {video_path}（--reuse 不會重新輸出影片），這份資料先不附影片", file=sys.stderr)
     players = []
-    for p in range(4):
+    for p in range(n_players):
         frames = [None if not np.all(np.isfinite(poses[p, i, [J['left_hip'], J['right_hip']]]))
                   else [None if not np.isfinite(v) else round(float(v), 3) for v in poses[p, i].ravel()]
                   for i in range(n_out)]
@@ -280,7 +298,7 @@ def main():
             "id": f"p{p + 1}",
             "name": names[p],
             "color": colors[p],
-            "side": "near" if p < 2 else "far",
+            "side": "near" if p < n_players // 2 else "far",
             "frames": frames,
             "conf": [round(float(c), 2) for c in conf[p]],
         })
@@ -291,6 +309,7 @@ def main():
     data = {
         "format": "pickleball-3d",
         "version": 1,
+        "sport": sport.id,
         "title": args.title or Path(args.video).stem,
         "fps": fps_out,
         "frameCount": n_out,

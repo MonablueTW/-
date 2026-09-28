@@ -61,6 +61,7 @@ export function normalize(raw) {
   }
 
   return {
+    sport: raw.sport ?? 'pickleball',
     title: raw.title ?? '',
     fps,
     frameCount,

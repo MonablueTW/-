@@ -1,11 +1,18 @@
 // 把示範資料畫成「攝影機拍到的畫面」（擬真風格：球場、牆、有衣服和球拍的人），給網站的對照影片用。
+// 網址參數 ?sport=tennis 或 ?sport=pickleball
 import * as THREE from 'three';
 import { generateDemo } from '../../web/js/demo.js';
+import { SCRIPTS } from '../../web/js/demo-scripts.js';
 import { normalize } from '../../web/js/format.js';
-import { COURT } from '../../web/js/court.js';
+import { getSport } from '../../web/js/court.js';
 import { makeOverlayCamera } from '../../web/js/scene.js';
 
-const data = normalize(generateDemo());
+const sportId = new URLSearchParams(location.search).get('sport') ?? 'tennis';
+const script = SCRIPTS[sportId];
+const sport = getSport(sportId);
+const tennis = sportId === 'tennis';
+const { postX, netPost, netCenter } = sport;
+const data = normalize(generateDemo(sportId));
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
 renderer.setSize(canvas.width, canvas.height, false);
@@ -37,17 +44,16 @@ function plane(w, l, material, y = 0) {
   scene.add(m);
   return m;
 }
-const { halfWidth: hw, halfLength: hl, kitchen: k, line: lw } = COURT;
-plane(30, 40, mat(0x2d8c7e));
-for (const s of [1, -1]) plane(hw * 2, hl - k, mat(0x2f6ad0), 0.002).position.z = s * (k + (hl - k) / 2);
+const rectPlane = ([x0, z0, x1, z1], material, y) => {
+  const m = plane(x1 - x0, z1 - z0, material, y);
+  m.position.x = (x0 + x1) / 2;
+  m.position.z = (z0 + z1) / 2;
+};
+plane(60, 80, mat(tennis ? 0x3b7d5c : 0x2d8c7e));
+const courtMat = mat(tennis ? 0x2f5ea3 : 0x2f6ad0);
+for (const r of sport.surfaces) rectPlane(r, courtMat, 0.002);
 const white = mat(0xf2f4f6);
-const line = (x, z, w, l) => { const m = plane(w, l, white, 0.004); m.position.x = x; m.position.z = z; };
-for (const s of [1, -1]) {
-  line(0, s * (hl - lw / 2), hw * 2, lw);
-  line(s * (hw - lw / 2), 0, lw, hl * 2);
-  line(0, s * (k - lw / 2), hw * 2, lw);
-  line(0, s * (k + (hl - k) / 2), lw, hl - k);
-}
+for (const r of sport.lines) rectPlane(r, white, 0.004);
 
 // 牆：深色浪板
 const wallTex = (() => {
@@ -65,13 +71,14 @@ const wallTex = (() => {
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
 })();
-const hall = new THREE.Mesh(new THREE.BoxGeometry(24, 9, 34), new THREE.MeshStandardMaterial({ map: wallTex, side: THREE.BackSide, roughness: 0.9 }));
-hall.position.y = 4.49; // 底面放在地板下面一點，避免和地板重疊閃爍
+const [hallW, hallH, hallL] = tennis ? [40, 14, 62] : [24, 9, 34];
+const hall = new THREE.Mesh(new THREE.BoxGeometry(hallW, hallH, hallL), new THREE.MeshStandardMaterial({ map: wallTex, side: THREE.BackSide, roughness: 0.9 }));
+hall.position.y = hallH / 2 - 0.01; // 底面放在地板下面一點，避免和地板重疊閃爍
 scene.add(hall);
 for (let i = -2; i <= 2; i++) {
-  for (const x of [-5, 5]) {
+  for (const x of [-hallW * 0.21, hallW * 0.21]) {
     const lamp = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 0.7), new THREE.MeshBasicMaterial({ color: 0xffffff }));
-    lamp.position.set(x, 8.9, i * 6);
+    lamp.position.set(x, hallH - 0.1, i * hallL * 0.18);
     lamp.rotation.x = Math.PI / 2;
     scene.add(lamp);
   }
@@ -87,36 +94,31 @@ const netTex = (() => {
   g.strokeRect(0, 0, 64, 64);
   const t = new THREE.CanvasTexture(c);
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
-  t.repeat.set(170, 22);
+  t.repeat.set(postX * 25, 22);
   return t;
 })();
-const netTop = (x) => COURT.netCenter + (COURT.netPost - COURT.netCenter) * (x / COURT.postX) ** 2;
-const netGeo = new THREE.PlaneGeometry(COURT.postX * 2, 1, 40, 1);
+const netTop = (x) => netCenter + (netPost - netCenter) * (x / postX) ** 2;
+const netGeo = new THREE.PlaneGeometry(postX * 2, 1, 40, 1);
 const np = netGeo.attributes.position;
 for (let i = 0; i < np.count; i++) np.setY(i, np.getY(i) > 0 ? netTop(np.getX(i)) : 0.04);
 const net = new THREE.Mesh(netGeo, new THREE.MeshStandardMaterial({ map: netTex, transparent: true, alphaTest: 0.2, side: THREE.DoubleSide, color: 0x222831 }));
 scene.add(net);
 const tape = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(
-  Array.from({ length: 21 }, (_, i) => { const x = -COURT.postX + (i / 20) * COURT.postX * 2; return new THREE.Vector3(x, netTop(x), 0); })), 40, 0.025, 6), mat(0xffffff));
+  Array.from({ length: 21 }, (_, i) => { const x = -postX + (i / 20) * postX * 2; return new THREE.Vector3(x, netTop(x), 0); })), 40, 0.025, 6), mat(0xffffff));
 scene.add(tape);
 for (const s of [1, -1]) {
-  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, COURT.netPost + 0.05, 12), mat(0x111111, { roughness: 0.4 }));
-  post.position.set(s * COURT.postX, (COURT.netPost + 0.05) / 2, 0);
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, netPost + 0.05, 12), mat(0x111111, { roughness: 0.4 }));
+  post.position.set(s * postX, (netPost + 0.05) / 2, 0);
   post.castShadow = true;
   scene.add(post);
   const foot = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.05, 0.9), mat(0x111111));
-  foot.position.set(s * COURT.postX, 0.025, 0);
+  foot.position.set(s * postX, 0.025, 0);
   scene.add(foot);
 }
 
 // ---------- 人 ----------
 const SKIN = 0xc99a7a;
-const OUTFITS = [
-  { shirt: 0xe8c21c, shorts: 0x1e2026 }, // 近場·黃衣
-  { shirt: 0x1d1f24, shorts: 0x1e2026 }, // 近場·黑衣
-  { shirt: 0xeceff2, shorts: 0x3a3f4a }, // 遠場·白衣
-  { shirt: 0x1d1f24, shorts: 0x2a2d35 }, // 遠場·黑衣
-];
+const OUTFITS = script.players; // { shirt, shorts }
 const J = data.jointIndex;
 const Y = new THREE.Vector3(0, 1, 0);
 const tmp = new THREE.Vector3();
@@ -151,12 +153,26 @@ class Person {
     this.neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.05, 1, 10), mat(SKIN));
     this.shoes = [0, 1].map(() => new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.07, 0.27), mat(0xeeeeee, { roughness: 0.5 })));
     this.paddle = new THREE.Group();
-    const face = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.014, 24), mat(0x2b2f3a, { roughness: 0.4 }));
-    face.scale.set(1, 1, 1.3);
-    face.rotation.x = Math.PI / 2;
-    face.position.y = 0.22;
-    const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.13, 8), mat(0x111111));
-    handle.position.y = 0.07;
+    let face, handle;
+    if (tennis) {
+      // 網球拍：橢圓拍框＋半透明拍線＋拍喉＋握把，全長約 0.68 m
+      face = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.009, 8, 32), mat(0x1c1f26, { roughness: 0.4 }));
+      face.scale.set(1, 1.28, 1);
+      face.position.y = 0.46;
+      const strings = new THREE.Mesh(new THREE.CircleGeometry(0.125, 32),
+        new THREE.MeshStandardMaterial({ color: 0xe8e8e8, transparent: true, opacity: 0.35, side: THREE.DoubleSide }));
+      strings.scale.set(1, 1.28, 1);
+      face.add(strings);
+      handle = new THREE.Mesh(new THREE.CylinderGeometry(0.016, 0.016, 0.34, 8), mat(0x111111));
+      handle.position.y = 0.13;
+    } else {
+      face = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.014, 24), mat(0x2b2f3a, { roughness: 0.4 }));
+      face.scale.set(1, 1, 1.3);
+      face.rotation.x = Math.PI / 2;
+      face.position.y = 0.22;
+      handle = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.13, 8), mat(0x111111));
+      handle.position.y = 0.07;
+    }
     this.paddle.add(face, handle);
     for (const m of [this.torso, this.pelvis, this.head, this.hair, this.neck, ...this.shoes, face, handle]) m.castShadow = true;
     this.group.add(this.torso, this.pelvis, this.head, this.hair, this.neck, ...this.shoes, this.paddle);
@@ -225,8 +241,8 @@ class Person {
   }
 }
 
-const people = data.players.map((p, i) => new Person(p, OUTFITS[i % OUTFITS.length]));
-const ball = new THREE.Mesh(new THREE.SphereGeometry(0.037, 16, 12), mat(0xd8f03c, { emissive: 0x5a6a10, roughness: 0.5 }));
+const people = data.players.map((p, i) => new Person(p, OUTFITS[i]));
+const ball = new THREE.Mesh(new THREE.SphereGeometry(sport.ballRadius, 16, 12), mat(0xd8f03c, { emissive: 0x5a6a10, roughness: 0.5 }));
 ball.castShadow = true;
 scene.add(ball);
 

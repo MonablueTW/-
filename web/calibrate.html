@@ -12,6 +12,7 @@
   <header class="calib-bar">
     <a class="back" href="./">‹ 3D 檢視</a>
     <h1>球場校正點標記</h1>
+    <select id="sportSelect" aria-label="球種"></select>
     <label class="file-btn">選擇影片／圖片<input id="fileMedia" type="file" accept="video/*,image/*" hidden></label>
     <div id="timeGroup" class="time-group" hidden>
       <input id="time" type="range" min="0" max="0" step="0.01" value="0" aria-label="選擇畫面">
@@ -33,11 +34,11 @@
       <div id="status" class="message" hidden></div>
     </div>
     <aside class="calib-side">
-      <svg id="diagram" viewBox="-4.6 -8.2 9.2 16.4" aria-label="球場示意圖"></svg>
+      <svg id="diagram" viewBox="-7 -13.3 14 26.6" aria-label="球場示意圖"></svg>
       <p class="diagram-note">▲ 攝影機在下方（近場那一側）</p>
       <ol id="pointList" class="point-list"></ol>
       <div class="help">
-        <p><strong>至少 4 個地面點</strong>（例如近端底線兩角＋近端廚房線兩端），越分散越準。看不到的點可以跳過。</p>
+        <p>先在左上選<strong>球種</strong>。<strong>至少 4 個地面點</strong>（例如近端底線兩角＋近端發球線／廚房線兩端），越分散越準。看不到的點可以跳過。</p>
         <p>點線的<strong>外緣交點</strong>。放大後用方向鍵可以微調 0.5 像素；Delete 刪除目前的點。</p>
         <p>點滿 4 個地面點後，黃線會畫出推算的球場線，應該和畫面上的線重疊。</p>
         <p>下載後執行：<code>python calibrate.py --points points.json --video 影片.mp4</code></p>

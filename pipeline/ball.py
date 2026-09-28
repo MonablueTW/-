@@ -1,9 +1,10 @@
 """球的偵測與 3D 軌跡。
 
-單一攝影機看不出球有多遠，但球在空中只受重力影響（拋物線）：
-一段飛行有 6 個未知數（起點 3 + 初速 3），每一格的 2D 位置提供 2 個方程式，
-而且方程式對未知數是線性的 → 幾格就能用最小平方法解出 3D 軌跡。
-落地反彈的那一格再加上「高度 = 0」的條件，會更穩。
+單一攝影機看不出球有多遠，但球在空中的加速度幾乎固定（重力＋空氣阻力＋旋轉）：
+一段飛行的未知數是起點、初速、加速度，每一格的 2D 位置提供 2 個方程式，
+而且方程式對未知數是線性的 → 用最小平方法就能解出 3D 軌跡。
+加速度給一個「接近重力」的先驗（垂直方向約 -9.8 m/s²），深度和尺度就定得下來；
+落地反彈、擊球的手也當成參考點，短的飛行段會穩很多。
 
 2D 偵測用「在動 + 顏色像球」：三格相減找出移動的小東西，再用球的顏色（預設黃綠色）過濾。
 這是入門做法；想要更準可以換成 TrackNet 之類專門抓球的模型（見 README）。
@@ -15,10 +16,16 @@ from collections import deque
 import cv2
 import numpy as np
 
-from court import HALF_L, HALF_W, Camera
+from court import Camera, Sport
 
 G = np.array([0.0, -9.81, 0.0])
-BALL_RADIUS = 0.037
+# 球種的合理範圍：最高高度（公尺）、最大速度（m/s）、一格之內在畫面上最多移動畫面寬度的幾分之幾
+LIMITS = {"pickleball": (7.0, 35.0, 0.06), "tennis": (14.0, 75.0, 0.1)}
+# 加速度先驗（平均, 標準差）：水平方向主要是空氣阻力，垂直方向是重力（上旋會再往下拉一點）
+ACCEL_PRIOR = {
+    "pickleball": (np.array([0.0, -9.81, 0.0]), np.array([6.0, 3.0, 6.0])),
+    "tennis": (np.array([0.0, -9.81, 0.0]), np.array([12.0, 4.0, 12.0])),
+}
 
 
 class BallDetector:
@@ -118,59 +125,85 @@ def link_tracks(cands: dict[int, list], max_jump: float, max_gap: int = 3, min_l
     return out
 
 
-def fit_arc(cam: Camera, obs: list, fps: float, t0: int, bounce_at: list[int] = (), bounce_weight=15.0,
-            anchors: list = ()):
-    """一段拋物線：X(t) = p0 + v0·dt + ½·g·dt²。回傳 (p0, v0, rms 像素誤差)。"""
+def fit_arc(cam: Camera, obs: list, fps: float, t0: int, bounce_at: list[int] = (), anchors: list = (),
+            accel_prior=None, ball_radius: float = 0.037, px_sigma: float = 1.5):
+    """一段飛行：X(t) = p0 + v0·dt + ½·a·dt²。
+    accel_prior=None → a 固定為重力；(平均, 標準差) → a 也一起解（有空氣阻力、旋轉的球）。
+    bounce_at：落地前最後一格（球離地約 5 公分，容許 10 公分）；anchors：[(影格, 位置, 容許誤差)]。
+    回傳 (p0, v0, a, rms 像素誤差)。"""
     P = cam.P
     uv = cam.undistort(np.array([[u, v] for _, u, v in obs]))
     ts = np.array([(f - t0) / fps for f, _, _ in obs])
-    A, b = [], []
+    free = accel_prior is not None
+    rows, rhs = [], []
     for dt, (u, v) in zip(ts, uv):
-        gterm = 0.5 * G * dt * dt
         for coord, Prow in ((u, P[0]), (v, P[1])):
             a = coord * P[2, :3] - Prow[:3]
             c = coord * P[2, 3] - Prow[3]
-            A.append(np.concatenate([a, a * dt]))
-            b.append(-(c + a @ gterm))
-    A, b = np.array(A), np.array(b)
+            if free:
+                rows.append(np.concatenate([a, a * dt, a * 0.5 * dt * dt]))
+                rhs.append(-c)
+            else:
+                rows.append(np.concatenate([a, a * dt]))
+                rhs.append(-(c + a @ (0.5 * G * dt * dt)))
+    A, b = np.array(rows), np.array(rhs)
+    n = A.shape[1]
+
+    def extra(dt, axis):
+        r = np.zeros(n)
+        r[axis], r[3 + axis] = 1, dt
+        if free:
+            r[6 + axis] = 0.5 * dt * dt
+        return r, (0.0 if free else 0.5 * G[axis] * dt * dt)
+
+    prior_rows, prior_rhs = [], []
+    for fb in bounce_at:
+        r, g = extra((fb - t0) / fps, 1)
+        prior_rows.append(r / 0.1)
+        prior_rhs.append((ball_radius + 0.05 - g) / 0.1)
+    for fa, target, sigma in anchors:
+        for k in range(3):
+            r, g = extra((fa - t0) / fps, k)
+            prior_rows.append(r / sigma)
+            prior_rhs.append((target[k] - g) / sigma)
+    if free:
+        mean, sd = accel_prior
+        for k in range(3):
+            r = np.zeros(n)
+            r[6 + k] = 1 / sd[k]
+            prior_rows.append(r)
+            prior_rhs.append(mean[k] / sd[k])
 
     def solve(weights):
-        Aw, bw = A * weights[:, None], b * weights
-        for fb in bounce_at:  # 落地前最後一格：球離地很近（軟性條件，容許約 10 公分）
-            dt = (fb - t0) / fps
-            Aw = np.vstack([Aw, bounce_weight * np.array([0, 1, 0, 0, dt, 0])])
-            bw = np.append(bw, bounce_weight * (BALL_RADIUS + 0.05 - 0.5 * G[1] * dt * dt))
-        for fa, target, w in anchors:  # 擊球那一刻球在球員手附近（軟性條件）
-            dt = (fa - t0) / fps
-            for k in range(3):
-                row = np.zeros(6)
-                row[k], row[3 + k] = 1, dt
-                Aw = np.vstack([Aw, w * row])
-                bw = np.append(bw, w * (target[k] - 0.5 * G[k] * dt * dt))
+        Aw = np.vstack([A * weights[:, None]] + ([np.array(prior_rows)] if prior_rows else []))
+        bw = np.concatenate([b * weights] + ([np.array(prior_rhs)] if prior_rhs else []))
         sol, *_ = np.linalg.lstsq(Aw, bw, rcond=None)
-        return sol[:3], sol[3:]
+        return sol[:3], sol[3:6], (sol[6:9] if free else G.copy())
 
-    # 先粗解一次拿到深度，再用 1/深度 加權，讓每一列的誤差等於像素誤差
-    p0, v0 = solve(np.ones(len(A)))
-    X = p0 + np.outer(ts, v0) + 0.5 * np.outer(ts * ts, G)
-    depth = np.clip((X @ cam.R.T + cam.t)[:, 2], 0.5, 200)
-    p0, v0 = solve(np.repeat(1.0 / depth, 2))
-    X = p0 + np.outer(ts, v0) + 0.5 * np.outer(ts * ts, G)
-    err = cam.project(X) - np.array([[u, v] for _, u, v in obs])
-    return p0, v0, float(np.sqrt(np.mean(np.sum(err**2, axis=1))))
+    def positions(p0, v0, acc):
+        return p0 + np.outer(ts, v0) + 0.5 * np.outer(ts * ts, acc)
+
+    # 先用「到場地中心的距離」當深度粗解一次，再用算出的深度重新加權：每一列都變成「幾個標準差」
+    guess = float(np.linalg.norm(cam.center))
+    p0, v0, acc = solve(np.full(len(A), 1.0 / (guess * px_sigma)))
+    depth = np.clip((positions(p0, v0, acc) @ cam.R.T + cam.t)[:, 2], 0.5, 300)
+    p0, v0, acc = solve(np.repeat(1.0 / (depth * px_sigma), 2))
+    err = cam.project(positions(p0, v0, acc)) - np.array([[u, v] for _, u, v in obs])
+    return p0, v0, acc, float(np.sqrt(np.mean(np.sum(err**2, axis=1))))
 
 
-def plausible(p0, v0, ts) -> bool:
-    X = p0 + np.outer(ts, v0) + 0.5 * np.outer(ts * ts, G)
+def plausible(p0, v0, acc, ts, sport: Sport) -> bool:
+    max_h, max_v, _ = LIMITS[sport.id]
+    X = p0 + np.outer(ts, v0) + 0.5 * np.outer(ts * ts, acc)
     return (
-        np.all(X[:, 1] > -0.3) and np.all(X[:, 1] < 7)
-        and np.all(np.abs(X[:, 0]) < HALF_W + 6) and np.all(np.abs(X[:, 2]) < HALF_L + 6)
-        and np.linalg.norm(v0) < 35
+        np.all(X[:, 1] > -0.3) and np.all(X[:, 1] < max_h)
+        and np.all(np.abs(X[:, 0]) < sport.half_width + 6) and np.all(np.abs(X[:, 2]) < sport.half_length + 8)
+        and np.linalg.norm(v0) < max_v
     )
 
 
-def _hand_anchors(seg: list, wrist_anchor: dict | None, weight: float = 15.0) -> list:
-    """這段軌跡的頭尾如果貼近某位球員的手（2D），就把那隻手的 3D 位置當參考點。"""
+def _hand_anchors(seg: list, wrist_anchor: dict | None, sigma: float = 0.3) -> list:
+    """這段軌跡的頭尾如果貼近某位球員的手（2D），就把那隻手的 3D 位置當參考點（容許 sigma 公尺）。"""
     if not wrist_anchor:
         return []
     out = []
@@ -183,45 +216,45 @@ def _hand_anchors(seg: list, wrist_anchor: dict | None, weight: float = 15.0) ->
                     if d < 0.45 * h and np.all(np.isfinite(X[k])) and (best is None or d < best[0]):
                         best = (d, X[k])
         if best is not None:
-            out.append((f, best[1], weight))
+            out.append((f, best[1], sigma))
     return out
 
 
-def reconstruct_ball(cam: Camera, cands: dict[int, list], fps: float, first: int, last: int,
+def reconstruct_ball(cam: Camera, cands: dict[int, list], fps: float, first: int, last: int, sport: Sport,
                      wrist_anchor: dict | None = None, max_rms: float = 3.0, min_seg: int = 10) -> dict[int, np.ndarray]:
     """回傳 {影格: 3D 位置}。wrist_anchor：{影格: [(兩手腕 2D, 兩手腕 3D, 框高)]}。"""
     max_rms *= max(1.0, cam.width / 1280)
-    max_jump = 0.06 * cam.width  # 一格之內球在畫面上最多移動多少像素
+    max_jump = LIMITS[sport.id][2] * cam.width
+    prior = ACCEL_PRIOR[sport.id]
     positions: dict[int, np.ndarray] = {}
     for tr in link_tracks(cands, max_jump):
         i = 0
         while i + min_seg <= len(tr):
+            # 1) 先只看 2D：加速度可自由調整的模型能貼合有空氣阻力的彎曲，用來決定一段飛行到哪裡結束
             seg = tr[i:i + min_seg]
-            p0, v0, rms = fit_arc(cam, seg, fps, seg[0][0])
-            if rms > max_rms:
+            if fit_arc(cam, seg, fps, seg[0][0], accel_prior=prior)[3] > max_rms:
                 i += 1
                 continue
             j = i + min_seg
-            while j < len(tr):
-                p, v, r = fit_arc(cam, tr[i:j + 1], fps, tr[i][0])
-                if r > max_rms:
-                    break
-                p0, v0, rms, j = p, v, r, j + 1
+            while j < len(tr) and fit_arc(cam, tr[i:j + 1], fps, tr[i][0], accel_prior=prior)[3] <= max_rms:
+                j += 1
             seg = tr[i:j]
-            t0 = seg[0][0]
-            # 軌跡在畫面上「往下走再往上」→ 可能在這一段結束時落地，加上高度=0 再解一次
-            end_f = seg[-1][0]
+            t0, end_f = seg[0][0], seg[-1][0]
+            # 2) 再解 3D。單一攝影機看不出深度，要靠兩端的參考點定住：
+            #    軌跡在畫面上「往下走再往上」→ 這裡落地；頭尾貼近球員的手 → 擊球點
             bounce = [end_f] if j < len(tr) and seg[-1][2] > seg[-2][2] and tr[j][2] < seg[-1][2] else []
             hands = _hand_anchors(seg, wrist_anchor)
+            p0, v0, acc, rms = fit_arc(cam, seg, fps, t0, ball_radius=sport.ball_radius)  # 沒有參考點：只用重力
             if bounce or hands:
-                p, v, r = fit_arc(cam, seg, fps, t0, bounce_at=bounce, anchors=hands)
+                p, v, a, r = fit_arc(cam, seg, fps, t0, accel_prior=prior, ball_radius=sport.ball_radius,
+                                     bounce_at=bounce, anchors=hands)
                 if r < max_rms * 1.5:
-                    p0, v0 = p, v
+                    p0, v0, acc = p, v, a
             ts = np.arange(t0, end_f + 1)
             dts = (ts - t0) / fps
-            if plausible(p0, v0, dts):
-                X = p0 + np.outer(dts, v0) + 0.5 * np.outer(dts * dts, G)
-                X[:, 1] = np.maximum(X[:, 1], BALL_RADIUS)
+            if plausible(p0, v0, acc, dts, sport):
+                X = p0 + np.outer(dts, v0) + 0.5 * np.outer(dts * dts, acc)
+                X[:, 1] = np.maximum(X[:, 1], sport.ball_radius)
                 for f, x in zip(ts, X):
                     if first <= f <= last:
                         positions[int(f)] = x

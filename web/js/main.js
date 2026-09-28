@@ -1,6 +1,12 @@
 // 進入點：載入資料、控制播放、和對照影片同步、處理按鈕與快捷鍵。
 import { CourtView, VIEWS } from './scene.js';
 import { normalize } from './format.js';
+import { getSport } from './court.js';
+
+const DEMOS = [
+  ['tennis', '示範：網球單打'],
+  ['pickleball', '示範：匹克球雙打'],
+];
 
 const $ = (sel) => document.querySelector(sel);
 const video = $('#video');
@@ -24,15 +30,20 @@ async function boot() {
   const entries = Array.isArray(list) ? list.filter((e) => e && e.src) : [];
   setupDatasetSelect(entries);
 
-  const src = params.get('data') ?? (entries[0] ? `data/${entries[0].src}` : null);
+  // 網址後面加 #pickleball 或 #tennis 可以直接開那個示範
+  const hashDemo = DEMOS.find(([id]) => location.hash === `#${id}`)?.[0];
+  const src = params.get('data') ?? (hashDemo || !entries[0] ? null : `data/${entries[0].src}`);
+  let selected = src ?? `demo:${hashDemo ?? 'tennis'}`;
   try {
     if (src) await loadUrl(src);
-    else await loadDemo();
+    else await loadDemo(hashDemo ?? 'tennis');
   } catch (err) {
     console.error(err);
     showMessage(`載入失敗：${err.message}，改用示範資料。`, true);
-    await loadDemo();
+    await loadDemo('tennis');
+    selected = 'demo:tennis';
   }
+  $('#datasetSelect').value = selected;
 
   if (params.has('view')) selectView(params.get('view'), false);
   if (params.has('frame')) {
@@ -59,10 +70,9 @@ async function loadUrl(url) {
   hideMessage();
 }
 
-async function loadDemo() {
+async function loadDemo(sport) {
   const { generateDemo } = await import('./demo.js');
-  const raw = generateDemo();
-  const data = normalize(raw);
+  const data = normalize(generateDemo(sport));
   setData(data, pickVideo(data.video, new URL(location.href)));
 }
 
@@ -80,6 +90,9 @@ function setData(data, videoUrl) {
   state.time = 0;
   view.setData(data);
 
+  const heading = `${getSport(data.sport).name} 3D 重建`;
+  $('#appTitle').textContent = heading;
+  document.title = heading;
   $('#datasetTag').textContent = data.title;
   $('#legend').innerHTML = data.players
     .map((p) => `<li><span class="dot" style="background:${escapeHtml(p.color)}"></span>${escapeHtml(p.name)}</li>`)
@@ -213,7 +226,9 @@ function setPlaying(on) {
   state.playing = on;
   if (state.hasVideo) {
     if (on) {
-      video.play().catch(() => {
+      video.play().catch((err) => {
+        // 換影片來源（例如改用 blob）會中斷 play()，載入後會再播，不是被擋
+        if (err?.name === 'AbortError') return;
         // 瀏覽器不允許自動播放時停在暫停狀態
         state.playing = false;
         updatePlayUI();
@@ -298,18 +313,23 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'v' || e.key === 'V') toggleCompare();
 });
 
-// ---------- 資料選單（data/index.json） ----------
+// ---------- 資料選單：data/index.json 的回合 + 內建示範 ----------
 function setupDatasetSelect(entries) {
   const sel = $('#datasetSelect');
-  if (!entries.length) return;
   sel.innerHTML = entries
     .map((e) => `<option value="data/${escapeHtml(e.src)}">${escapeHtml(e.title ?? e.src)}</option>`)
-    .join('') + '<option value="__demo__">示範（合成資料）</option>';
+    .concat(DEMOS.map(([id, label]) => `<option value="demo:${id}">${label}</option>`))
+    .join('');
   sel.hidden = false;
   sel.addEventListener('change', async () => {
     try {
-      if (sel.value === '__demo__') await loadDemo();
+      if (sel.value.startsWith('demo:')) await loadDemo(sel.value.slice(5));
       else await loadUrl(sel.value);
+      // 網址跟著換，重新整理或分享連結時會開同一個
+      const url = new URL(location.href);
+      if (sel.value.startsWith('demo:')) { url.searchParams.delete('data'); url.hash = sel.value.slice(5); }
+      else { url.searchParams.set('data', sel.value); url.hash = ''; }
+      try { history.replaceState(null, '', url); } catch { /* 沙盒 iframe 可能不允許 */ }
     } catch (err) {
       showMessage(`載入失敗：${err.message}`, true);
     }

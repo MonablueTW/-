@@ -7,11 +7,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ball import G, fit_arc, link_tracks  # noqa: E402
+from ball import ACCEL_PRIOR, G, fit_arc, link_tracks  # noqa: E402
 from calibrate import solve  # noqa: E402
-from court import KEYPOINTS, Camera  # noqa: E402
+from court import SPORTS, Camera  # noqa: E402
 from lifting import J, JOINTS, place_body  # noqa: E402
 from players import COLOR_NAMES, Detection, PlayerTracker  # noqa: E402
+
+KEYPOINTS = SPORTS["pickleball"].keypoints
 from reconstruct import smooth_track  # noqa: E402
 
 
@@ -40,7 +42,7 @@ class CameraTest(unittest.TestCase):
         uv = cam.project(np.array([KEYPOINTS[n] for n in names]))
         rng = np.random.default_rng(0)
         points = {n: (p + rng.normal(0, 0.5, 2)).tolist() for n, p in zip(names, uv)}
-        solved, rms, _ = solve(points, cam.width, cam.height, fit_k1=False)
+        solved, rms, _ = solve(points, cam.width, cam.height, fit_k1=False, sport=SPORTS["pickleball"])
         self.assertLess(rms, 1.5)
         self.assertLess(np.linalg.norm(solved.center - cam.center), 0.1)
         self.assertAlmostEqual(solved.K[0, 0] / cam.K[0, 0], 1.0, delta=0.02)
@@ -53,7 +55,7 @@ class BallTest(unittest.TestCase):
         ts = np.arange(20) / 30
         X = p0 + np.outer(ts, v0) + 0.5 * np.outer(ts**2, G)
         obs = [(i, u, v) for i, (u, v) in enumerate(cam.project(X))]
-        p, v, rms = fit_arc(cam, obs, 30, 0)
+        p, v, _, rms = fit_arc(cam, obs, 30, 0)
         np.testing.assert_allclose(p, p0, atol=1e-5)
         np.testing.assert_allclose(v, v0, atol=1e-5)
         self.assertLess(rms, 1e-3)
@@ -85,6 +87,65 @@ class BallTest(unittest.TestCase):
         tracks = link_tracks(cands, max_jump=80)
         self.assertEqual(len(tracks[0]), 15)
         self.assertTrue(all(abs(u - (100 + 20 * f)) < 1e-6 for f, u, _ in tracks[0]))
+
+
+def simulate_tennis(p0, v0, spin_rpm, fps=30, r=0.0335):
+    """有空氣阻力與上旋的網球，飛到落地為止（每格一個位置）。"""
+    rho, m, cd = 1.2, 0.057, 0.55
+    area = np.pi * r * r
+    k, w = 0.5 * rho * cd * area / m, spin_rpm * 2 * np.pi / 60
+    x, v, out, i = np.array(p0, float), np.array(v0, float), [], 0
+    while x[1] > r or i == 0:
+        if i % (3000 // fps) == 0:
+            out.append(x.copy())
+        speed = np.linalg.norm(v)
+        horiz = np.array([v[0], 0, v[2]])
+        axis = np.cross(horiz / np.linalg.norm(horiz), [0, 1, 0])
+        lift = 0.3 * min(1, r * w / speed)
+        a = G - k * speed * v + 0.5 * rho * lift * area * speed * speed / m * np.cross(axis, v / speed)
+        v, x, i = v + a / 3000, x + v / 3000, i + 1
+    return np.array(out)
+
+
+class TennisTest(unittest.TestCase):
+    def test_tennis_calibration_from_broadcast_view(self):
+        sport = SPORTS["tennis"]
+        cam = make_camera(C=(0.0, 9.0, 25.0), target=(0.0, 0.0, -1.0), f=1500)
+        names = [n for n in sport.keypoints if n.startswith(("near_", "far_"))]
+        uv = cam.project(np.array([sport.keypoints[n] for n in names]))
+        rng = np.random.default_rng(5)
+        points = {n: (p + rng.normal(0, 0.7, 2)).tolist() for n, p in zip(names, uv)}
+        solved, rms, _ = solve(points, cam.width, cam.height, fit_k1=False)  # 球種由點名推斷
+        self.assertLess(rms, 1.5)
+        self.assertLess(np.linalg.norm(solved.center - cam.center), 0.3)
+
+    def test_anchored_drive_with_drag_and_topspin(self):
+        # 轉播機位看一球 30 m/s 的上旋抽球：兩端有參考點（擊球的手、落地）才定得住深度
+        cam = make_camera(C=(0.0, 9.0, 25.0), target=(0.0, 0.0, -1.0), f=1500)
+        X = simulate_tennis((1.0, 1.0, 11.5), (-0.8, 3.0, -30.0), 2500)
+        n, errs = len(X), []
+        for seed in range(10):
+            rng = np.random.default_rng(seed)
+            obs = [(i, u + rng.normal(0, 1.5), v + rng.normal(0, 1.5)) for i, (u, v) in enumerate(cam.project(X))]
+            hand = [(0, X[0] + rng.normal(0, 0.2, 3), 0.3)]
+            p, v, a, _ = fit_arc(cam, obs, 30, 0, accel_prior=ACCEL_PRIOR["tennis"], ball_radius=0.0335,
+                                 bounce_at=[n - 1], anchors=hand)
+            ts = np.arange(n) / 30
+            errs.append(np.median(np.linalg.norm(p + np.outer(ts, v) + 0.5 * np.outer(ts**2, a) - X, axis=1)))
+        self.assertLess(np.median(errs), 0.8)
+
+    def test_singles_tracker_keeps_one_player_per_side(self):
+        white, blue = np.zeros(len(COLOR_NAMES)), np.zeros(len(COLOR_NAMES))
+        white[COLOR_NAMES.index("白")] = 1
+        blue[COLOR_NAMES.index("藍")] = 1
+        tr = PlayerTracker(fps=10, per_side=1)
+        for f in range(30):
+            dets = [Detection(np.zeros(4), np.zeros((17, 3)), 0.9, np.array([np.sin(f / 5) * 3, 12.0]), white),
+                    Detection(np.zeros(4), np.zeros((17, 3)), 0.9, np.array([-np.sin(f / 5) * 3, -12.0]), blue)]
+            out = tr.assign(f, dets)
+            self.assertIs(out[0].color, white)
+            self.assertIs(out[1].color, blue)
+        self.assertEqual(tr.names(), ["近場·白衣", "遠場·藍衣"])
 
 
 class LiftingTest(unittest.TestCase):

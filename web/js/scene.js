@@ -1,7 +1,7 @@
-// 3D 場景：球場、球網、四個人偶、球、軌跡，以及各種視角。
+// 3D 場景：球場（網球或匹克球）、球網、人偶、球、軌跡，以及各種視角。
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { COURT, BONES, BALL_COLOR } from './court.js';
+import { getSport, BONES, BALL_COLOR } from './court.js';
 
 const COLORS = {
   background: 0x0d1015,
@@ -11,7 +11,7 @@ const COLORS = {
   net: 0x0f2622,
   post: 0x111417,
 };
-const GROUND = { width: 14, length: 24 };
+const PICKLEBALL_HALF_LENGTH = 6.7056; // 視角設定以匹克球場為基準，其他球場依長度等比放大
 const PLAYER_TRAIL_SEC = 2.0;
 const BALL_TRAIL_SEC = 0.7;
 const LIMB_RADIUS = 0.032;
@@ -43,6 +43,7 @@ export class CourtView {
     this.trailsOn = true;
     this.dirty = true;
     this.tween = null;
+    this.sport = getSport('pickleball');
 
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -56,7 +57,7 @@ export class CourtView {
     this.scene = scene;
     this.bgColor = scene.background;
 
-    this.camera = new THREE.PerspectiveCamera(40, 1, 0.2, 400);
+    this.camera = new THREE.PerspectiveCamera(40, 1, 0.2, 600);
     this.overlayCamera = null;
 
     this.controls = new OrbitControls(this.camera, canvas);
@@ -64,7 +65,6 @@ export class CourtView {
     this.controls.dampingFactor = 0.12;
     this.controls.maxPolarAngle = Math.PI * 0.495;
     this.controls.minDistance = 2;
-    this.controls.maxDistance = 80;
     this.controls.addEventListener('change', () => { this.dirty = true; });
     this.controls.addEventListener('start', () => { this.tween = null; this.userMoved = true; });
 
@@ -83,62 +83,52 @@ export class CourtView {
   buildLights() {
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x28323a, 1.6));
     const sun = new THREE.DirectionalLight(0xffffff, 2.2);
-    sun.position.set(-5, 14, 7);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
-    const s = sun.shadow.camera;
-    s.left = -10; s.right = 10; s.top = 14; s.bottom = -14; s.near = 1; s.far = 40;
     sun.shadow.bias = -0.0004;
     sun.shadow.normalBias = 0.02;
     this.scene.add(sun);
+    this.sun = sun;
   }
 
+  // 依球種畫出地面、場地、線、球網。換球種時會整個重建。
   buildCourt() {
+    for (const g of [this.courtGroup, this.lineGroup]) {
+      if (!g) continue;
+      this.scene.remove(g);
+      g.traverse((o) => { o.geometry?.dispose(); if (o.material !== this.lineMaterial) o.material?.dispose?.(); });
+    }
+    const sp = this.sport;
+    const scale = sp.halfLength / PICKLEBALL_HALF_LENGTH;
     const courtGroup = new THREE.Group(); // 疊合模式會隱藏
     const lineGroup = new THREE.Group(); // 疊合模式保留（半透明），用來檢查校正
-    const flat = (w, l, color, y, group, opts = {}) => {
-      const mesh = new THREE.Mesh(
-        new THREE.PlaneGeometry(w, l),
-        new THREE.MeshStandardMaterial({ color, roughness: 0.95, metalness: 0, ...opts }),
-      );
+    const flat = (x0, z0, x1, z1, material, y, group) => {
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(x1 - x0, z1 - z0), material);
       mesh.rotation.x = -Math.PI / 2;
-      mesh.position.y = y;
+      mesh.position.set((x0 + x1) / 2, y, (z0 + z1) / 2);
       mesh.receiveShadow = true;
       group.add(mesh);
       return mesh;
     };
-    flat(GROUND.width, GROUND.length, COLORS.ground, 0, courtGroup);
+    const [gw, gl] = sp.ground;
+    flat(-gw / 2, -gl / 2, gw / 2, gl / 2, new THREE.MeshStandardMaterial({ color: COLORS.ground, roughness: 0.95 }), 0, courtGroup);
+    // 地面、場地、線只差幾公釐高：遠距離（網球俯視）深度精度不夠會互相穿插成條紋，用 polygonOffset 固定前後順序
+    const courtMat = new THREE.MeshStandardMaterial({
+      color: COLORS.court, roughness: 0.95, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4,
+    });
+    for (const r of sp.surfaces) flat(...r, courtMat, 0.002, courtGroup);
 
-    const { halfWidth: hw, halfLength: hl, kitchen: k, line: lw } = COURT;
-    const serviceLen = hl - k;
-    for (const sgn of [1, -1]) {
-      const m = flat(hw * 2, serviceLen, COLORS.court, 0.002, courtGroup);
-      m.position.z = sgn * (k + serviceLen / 2);
-    }
+    this.lineMaterial ??= new THREE.MeshStandardMaterial({
+      color: COLORS.line, roughness: 0.8, transparent: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -8,
+    });
+    for (const r of sp.lines) flat(...r, this.lineMaterial, 0.004, lineGroup);
 
-    this.lineMaterial = new THREE.MeshStandardMaterial({ color: COLORS.line, roughness: 0.8, transparent: true });
-    const addLine = (x, z, w, l) => {
-      const m = new THREE.Mesh(new THREE.PlaneGeometry(w, l), this.lineMaterial);
-      m.rotation.x = -Math.PI / 2;
-      m.position.set(x, 0.004, z);
-      m.receiveShadow = true;
-      lineGroup.add(m);
-    };
-    for (const sgn of [1, -1]) {
-      addLine(0, sgn * (hl - lw / 2), hw * 2, lw); // 底線
-      addLine(sgn * (hw - lw / 2), 0, lw, hl * 2); // 邊線
-      addLine(0, sgn * (k - lw / 2), hw * 2, lw); // 廚房線
-      addLine(0, sgn * (k + serviceLen / 2), lw, serviceLen); // 中線
-    }
-
-    // 球網：中間略低（34 in），網柱處 36 in
-    const netTop = (x) => COURT.netCenter + (COURT.netPost - COURT.netCenter) * (x / COURT.postX) ** 2;
-    const netGeo = new THREE.PlaneGeometry(COURT.postX * 2, 1, 40, 1);
+    // 球網：中間比網柱低一點
+    const { postX, netPost, netCenter } = sp;
+    const netTop = (x) => netCenter + (netPost - netCenter) * (x / postX) ** 2;
+    const netGeo = new THREE.PlaneGeometry(postX * 2, 1, 40, 1);
     const p = netGeo.attributes.position;
-    for (let i = 0; i < p.count; i++) {
-      const x = p.getX(i);
-      p.setY(i, p.getY(i) > 0 ? netTop(x) : 0.03);
-    }
+    for (let i = 0; i < p.count; i++) p.setY(i, p.getY(i) > 0 ? netTop(p.getX(i)) : 0.03);
     netGeo.computeVertexNormals();
     const net = new THREE.Mesh(netGeo, new THREE.MeshStandardMaterial({
       color: COLORS.net, transparent: true, opacity: 0.62, side: THREE.DoubleSide, depthWrite: false, roughness: 1,
@@ -148,26 +138,42 @@ export class CourtView {
 
     const tapePts = [];
     for (let i = 0; i <= 40; i++) {
-      const x = -COURT.postX + (i / 40) * COURT.postX * 2;
+      const x = -postX + (i / 40) * postX * 2;
       tapePts.push(new THREE.Vector3(x, netTop(x), 0));
     }
     const tape = new THREE.Mesh(
-      new THREE.TubeGeometry(new THREE.CatmullRomCurve3(tapePts), 40, 0.018, 6, false),
+      new THREE.TubeGeometry(new THREE.CatmullRomCurve3(tapePts), 40, 0.018 * Math.sqrt(scale), 6, false),
       new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 }),
     );
     tape.castShadow = true;
     lineGroup.add(tape);
+    const postR = 0.03 * Math.sqrt(scale);
     for (const sgn of [1, -1]) {
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, COURT.netPost + 0.03, 12),
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(postR, postR, netPost + 0.03, 12),
         new THREE.MeshStandardMaterial({ color: COLORS.post, roughness: 0.5 }));
-      post.position.set(sgn * COURT.postX, (COURT.netPost + 0.03) / 2, 0);
+      post.position.set(sgn * postX, (netPost + 0.03) / 2, 0);
       post.castShadow = true;
       lineGroup.add(post);
     }
 
+    // 陰影範圍跟著球場大小
+    this.sun.position.set(-5 * scale, 14 * scale, 7 * scale);
+    const sc = this.sun.shadow.camera;
+    const half = Math.max(gw, gl) * 0.6;
+    Object.assign(sc, { left: -half, right: half, top: half, bottom: -half, near: 1, far: 40 * scale });
+    sc.updateProjectionMatrix();
+    this.controls.maxDistance = 12 * sp.halfLength;
+
     this.courtGroup = courtGroup;
     this.lineGroup = lineGroup;
     this.scene.add(courtGroup, lineGroup);
+  }
+
+  setSport(id) {
+    const sport = getSport(id);
+    if (sport === this.sport) return;
+    this.sport = sport;
+    this.buildCourt();
   }
 
   // ---------- 資料 ----------
@@ -175,10 +181,13 @@ export class CourtView {
     for (const p of this.players) p.dispose();
     this.ball?.dispose();
     this.data = data;
+    const sportChanged = getSport(data.sport) !== this.sport;
+    this.setSport(data.sport);
     this.players = data.players.map((p) => new PlayerFigure(p, data, this.scene));
     this.ball = data.ball ? new BallFigure(data, this.scene) : null;
     this.overlayCamera = data.camera ? makeOverlayCamera(data.camera) : null;
     if (this.viewName === 'overlay' && !this.overlayCamera) this.setView('orbit', false);
+    else if (sportChanged && this.viewName !== 'overlay') this.setView(this.viewName, false);
     this.applyOverlayStyle();
     this.setFrame(0, true);
   }
@@ -238,13 +247,15 @@ export class CourtView {
   // 讓整個球場（含場外一點空間與人的高度）剛好塞進畫面
   computeViewPose(name) {
     const v = VIEWS[name];
-    const target = new THREE.Vector3(...v.target);
+    const sp = this.sport;
+    const scale = sp.halfLength / PICKLEBALL_HALF_LENGTH;
+    const target = new THREE.Vector3(v.target[0], v.target[1], v.target[2] * scale);
     const dir = new THREE.Vector3(...v.dir).normalize();
     const aspect = this.aspect || 1;
     const pts = [];
     const [marginX, marginZ] = v.margin ?? [0.8, 1.2];
-    const mx = COURT.halfWidth + marginX;
-    const mz = COURT.halfLength + marginZ;
+    const mx = sp.halfWidth + marginX * scale;
+    const mz = sp.halfLength + marginZ * scale;
     for (const x of [-mx, mx]) for (const z of [-mz, mz]) for (const y of [0, 1.9]) pts.push(new THREE.Vector3(x, y, z));
     const cam = new THREE.PerspectiveCamera(v.fov, aspect, 0.1, 500);
     const fits = (d) => {
@@ -258,7 +269,7 @@ export class CourtView {
       }
       return true;
     };
-    let lo = 2, hi = 200;
+    let lo = 2, hi = 400;
     for (let i = 0; i < 40; i++) {
       const mid = (lo + hi) / 2;
       if (fits(mid)) hi = mid; else lo = mid;
@@ -532,7 +543,7 @@ class BallFigure {
     this.data = data;
     const color = new THREE.Color(BALL_COLOR);
     this.mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(0.055, 20, 14),
+      new THREE.SphereGeometry(Math.max(0.05, getSport(data.sport).ballRadius * 1.5), 20, 14),
       new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.35, roughness: 0.45 }),
     );
     this.mesh.castShadow = true;

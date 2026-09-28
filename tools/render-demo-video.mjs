@@ -1,6 +1,7 @@
-// 重新產生網站的示範影片（web/demo/demo.mp4、demo.webm）。只有修改 web/js/demo.js 之後才需要跑。
+// 重新產生網站的示範影片（web/demo/<球種>.mp4、.webm）。只有修改示範劇本（web/js/demo*.js）之後才需要跑。
 // 需要：Node 18+、playwright（npm i -g playwright && npx playwright install chromium）、ffmpeg
-//   node tools/render-demo-video.mjs
+//   node tools/render-demo-video.mjs            （網球和匹克球都重畫）
+//   node tools/render-demo-video.mjs tennis     （只畫一種）
 // 可用環境變數 FFMPEG 指定 ffmpeg 路徑。
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
@@ -42,36 +43,39 @@ const server = createServer(async (req, res) => {
 await new Promise((r) => server.once('listening', r));
 const port = server.address().port;
 
-const frames = join(tmpdir(), 'pk3d-demo-frames');
-await rm(frames, { recursive: true, force: true });
-await mkdir(frames, { recursive: true });
-
+const sports = process.argv[2] ? [process.argv[2]] : ['tennis', 'pickleball'];
+const ffmpeg = process.env.FFMPEG || 'ffmpeg';
 const browser = await playwright.chromium.launch({ args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'] });
-const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-page.on('pageerror', (e) => console.error('[page]', e.message));
-await page.goto(`http://127.0.0.1:${port}/tools/demo-footage/index.html`);
-await page.waitForFunction(() => window.ready === true, null, { timeout: 60000 });
-const n = await page.evaluate(() => window.frameCount);
-for (let f = 0; f < n; f++) {
-  await page.evaluate((i) => window.renderFrame(i), f);
-  await page.screenshot({ path: join(frames, `f${String(f).padStart(5, '0')}.png`), clip: { x: 0, y: 0, width: 1280, height: 720 } });
-  if (f % 50 === 0) console.log(`畫面 ${f}/${n}`);
+await mkdir(join(root, 'web/demo'), { recursive: true });
+for (const sport of sports) {
+  const frames = join(tmpdir(), `pk3d-demo-frames-${sport}`);
+  await rm(frames, { recursive: true, force: true });
+  await mkdir(frames, { recursive: true });
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  page.on('pageerror', (e) => console.error('[page]', e.message));
+  await page.goto(`http://127.0.0.1:${port}/tools/demo-footage/index.html?sport=${sport}`);
+  await page.waitForFunction(() => window.ready === true, null, { timeout: 60000 });
+  const n = await page.evaluate(() => window.frameCount);
+  for (let f = 0; f < n; f++) {
+    await page.evaluate((i) => window.renderFrame(i), f);
+    await page.screenshot({ path: join(frames, `f${String(f).padStart(5, '0')}.png`), clip: { x: 0, y: 0, width: 1280, height: 720 } });
+    if (f % 50 === 0) console.log(`${sport} 畫面 ${f}/${n}`);
+  }
+  await page.close();
+  const input = ['-y', '-loglevel', 'error', '-framerate', '30', '-i', join(frames, 'f%05d.png')];
+  for (const [ext, codec] of [
+    ['mp4', ['-c:v', 'libx264', '-preset', 'slow', '-crf', '27', '-pix_fmt', 'yuv420p', '-movflags', '+faststart']],
+    ['webm', ['-c:v', 'libvpx-vp9', '-b:v', '0', '-crf', '38', '-row-mt', '1', '-pix_fmt', 'yuv420p']],
+  ]) {
+    const out = join(root, 'web/demo', `${sport}.${ext}`);
+    const r = spawnSync(ffmpeg, [...input, ...codec, out], { stdio: 'inherit' });
+    if (r.status !== 0) {
+      console.error(`ffmpeg 失敗（${sport}.${ext}）`);
+      process.exit(1);
+    }
+    console.log(`已輸出 web/demo/${sport}.${ext}`);
+  }
+  await rm(frames, { recursive: true, force: true });
 }
 await browser.close();
 server.close();
-
-const ffmpeg = process.env.FFMPEG || 'ffmpeg';
-const input = ['-y', '-loglevel', 'error', '-framerate', '30', '-i', join(frames, 'f%05d.png')];
-await mkdir(join(root, 'web/demo'), { recursive: true });
-for (const [out, codec] of [
-  ['demo.mp4', ['-c:v', 'libx264', '-preset', 'slow', '-crf', '27', '-pix_fmt', 'yuv420p', '-movflags', '+faststart']],
-  ['demo.webm', ['-c:v', 'libvpx-vp9', '-b:v', '0', '-crf', '38', '-row-mt', '1', '-pix_fmt', 'yuv420p']],
-]) {
-  const r = spawnSync(ffmpeg, [...input, ...codec, join(root, 'web/demo', out)], { stdio: 'inherit' });
-  if (r.status !== 0) {
-    console.error(`ffmpeg 失敗（${out}）`);
-    process.exit(1);
-  }
-  console.log(`已輸出 web/demo/${out}`);
-}
-await rm(frames, { recursive: true, force: true });

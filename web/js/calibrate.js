@@ -1,5 +1,8 @@
 // 球場校正點標記工具：在影片畫面上點出球場角點，匯出 points.json 給 pipeline/calibrate.py。
-import { COURT, KEYPOINTS } from './court.js';
+import { SPORTS, getSport } from './court.js';
+
+let sport = getSport('tennis');
+let KEYPOINTS = sport.keypoints;
 
 const $ = (s) => document.querySelector(s);
 const canvas = $('#stage');
@@ -14,6 +17,7 @@ const state = {
   time: 0,
   points: new Map(), // 名稱 → [u, v]（原始像素）
   active: KEYPOINTS[0][0],
+
   view: { scale: 1, ox: 0, oy: 0 }, // 畫面座標 = 影像座標 × scale + offset
   homography: null,
 };
@@ -105,39 +109,52 @@ $('#btnMedian').addEventListener('click', async () => {
   draw();
 });
 
-// ---------- 點清單與示意圖 ----------
+// ---------- 球種、點清單與示意圖 ----------
+function setSport(id) {
+  sport = getSport(id);
+  KEYPOINTS = sport.keypoints;
+  state.points = new Map(); // 不同球場的點位置都不一樣（名稱相同也是），換球種就重新標
+  state.active = KEYPOINTS[0][0];
+  $('#sportSelect').value = sport.id;
+  buildList();
+  refresh();
+}
+
+$('#sportSelect').innerHTML = Object.values(SPORTS).map((sp) => `<option value="${sp.id}">${sp.name}</option>`).join('');
+$('#sportSelect').addEventListener('change', (e) => setSport(e.target.value));
+
+$('#pointList').addEventListener('click', (e) => {
+  const li = e.target.closest('li');
+  if (!li) return;
+  if (e.target.classList.contains('del')) state.points.delete(li.dataset.name);
+  state.active = li.dataset.name;
+  refresh();
+});
+$('#diagram').addEventListener('click', (e) => {
+  const name = e.target.dataset?.name;
+  if (name) { state.active = name; refresh(); }
+});
+
 function buildList() {
   $('#pointList').innerHTML = KEYPOINTS.map(([name, label]) =>
     `<li data-name="${name}"><span class="dot"></span><span>${label}</span><span class="xy"></span><button class="del" type="button" title="刪除">✕</button></li>`).join('');
-  $('#pointList').addEventListener('click', (e) => {
-    const li = e.target.closest('li');
-    if (!li) return;
-    if (e.target.classList.contains('del')) state.points.delete(li.dataset.name);
-    state.active = li.dataset.name;
-    refresh();
-  });
   // 示意圖：俯視，近場（攝影機）在下
-  const { halfWidth: hw, halfLength: hl, kitchen: k, postX } = COURT;
-  const line = (x1, z1, x2, z2) => `<line x1="${x1}" y1="${z1}" x2="${x2}" y2="${z2}" />`;
-  const lines = [
-    line(-hw, -hl, hw, -hl), line(-hw, hl, hw, hl), line(-hw, -hl, -hw, hl), line(hw, -hl, hw, hl),
-    line(-hw, -k, hw, -k), line(-hw, k, hw, k), line(0, k, 0, hl), line(0, -k, 0, -hl),
-  ].join('');
+  const { halfWidth: hw, halfLength: hl, postX } = sport;
+  const mx = hw + 1.4, mz = hl + 1.4;
+  const rect = ([x0, z0, x1, z1], fill) => `<rect x="${x0}" y="${z0}" width="${x1 - x0}" height="${z1 - z0}" fill="${fill}" />`;
+  const r = hl / 6.7; // 圓點大小跟著球場比例
   const dots = KEYPOINTS.map(([name, , x, y, z]) => {
-    const dy = y > 0 ? -0.45 : 0; // 網柱頂稍微往上畫，和網柱底分開
-    return `<circle data-name="${name}" cx="${x}" cy="${z + dy}" r="0.26" />`;
+    const dy = y > 0 ? -0.45 * r : 0; // 網柱頂稍微往上畫，和網柱底分開
+    return `<circle data-name="${name}" cx="${x}" cy="${z + dy}" r="${0.26 * r}" />`;
   }).join('');
-  $('#diagram').innerHTML = `
-    <rect x="-4.6" y="-8.2" width="9.2" height="16.4" fill="#216b5c" />
-    <rect x="${-hw}" y="${k}" width="${2 * hw}" height="${hl - k}" fill="#2a5bb0" />
-    <rect x="${-hw}" y="${-hl}" width="${2 * hw}" height="${hl - k}" fill="#2a5bb0" />
-    <g stroke="#fff" stroke-width="0.07">${lines}</g>
-    <line x1="${-postX}" y1="0" x2="${postX}" y2="0" stroke="#111" stroke-width="0.14" />
+  const svg = $('#diagram');
+  svg.setAttribute('viewBox', `${-mx} ${-mz} ${2 * mx} ${2 * mz}`);
+  svg.innerHTML = `
+    <rect x="${-mx}" y="${-mz}" width="${2 * mx}" height="${2 * mz}" fill="#216b5c" />
+    ${sport.surfaces.map((s) => rect(s, '#2a5bb0')).join('')}
+    ${sport.lines.map((s) => rect(s, '#ffffff')).join('')}
+    <line x1="${-postX}" y1="0" x2="${postX}" y2="0" stroke="#111" stroke-width="${0.14 * r}" />
     <g class="kp">${dots}</g>`;
-  $('#diagram').addEventListener('click', (e) => {
-    const name = e.target.dataset?.name;
-    if (name) { state.active = name; refresh(); }
-  });
 }
 
 function refresh() {
@@ -257,11 +274,8 @@ function draw() {
   // 推算的球場線（至少 4 個地面點）
   if (state.homography) {
     const H = state.homography;
-    const { halfWidth: hw, halfLength: hl, kitchen: k } = COURT;
-    const segs = [];
-    for (const s of [1, -1]) {
-      segs.push([-hw, s * hl, hw, s * hl], [s * hw, -hl, s * hw, hl], [-hw, s * k, hw, s * k], [0, s * k, 0, s * hl]);
-    }
+    const segs = sport.lines.map(([x0, z0, x1, z1]) =>
+      (x1 - x0 >= z1 - z0 ? [x0, (z0 + z1) / 2, x1, (z0 + z1) / 2] : [(x0 + x1) / 2, z0, (x0 + x1) / 2, z1]));
     ctx.strokeStyle = 'rgba(255, 214, 0, .85)';
     ctx.lineWidth = 1.5;
     for (const [x1, z1, x2, z2] of segs) {
@@ -400,6 +414,7 @@ $('#btnExport').addEventListener('click', () => {
   const ground = KEYPOINTS.filter(([n, , , y]) => y === 0 && state.points.has(n)).length;
   if (ground < 4 && !confirm(`目前只有 ${ground} 個地面點（至少要 4 個）。仍要下載嗎？`)) return;
   const out = {
+    sport: sport.id,
     width: frame.width,
     height: frame.height,
     video: state.source,
@@ -419,6 +434,7 @@ $('#filePoints').addEventListener('change', async (e) => {
   if (!file) return;
   try {
     const data = JSON.parse(await file.text());
+    if (data.sport && data.sport !== sport.id) setSport(data.sport);
     const sx = state.loaded && data.width ? frame.width / data.width : 1;
     const sy = state.loaded && data.height ? frame.height / data.height : 1;
     state.points = new Map(Object.entries(data.points ?? {}).map(([n, [u, v]]) => [n, [u * sx, v * sy]]));
@@ -447,5 +463,4 @@ function status(text, timeout = 0) {
 window.calib = { state, toScreen };
 
 new ResizeObserver(resizeCanvas).observe($('#stageWrap'));
-buildList();
-refresh();
+setSport(location.hash === '#pickleball' ? 'pickleball' : 'tennis');

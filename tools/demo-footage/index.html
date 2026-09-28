@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <title>示範影片產生器</title>
+  <style>html, body { margin: 0; background: #000; } canvas { display: block; }</style>
+  <script type="importmap">
+    { "imports": { "three": "../../web/vendor/three.module.min.js", "three/addons/": "../../web/vendor/addons/" } }
+  </script>
+</head>
+<body>
+  <!-- 由 tools/render-demo-video.mjs 開啟：把示範資料從「原始攝影機」的位置畫成擬真畫面，逐格截圖後合成影片 -->
+  <canvas id="c" width="1280" height="720"></canvas>
+  <div style="position:fixed;right:18px;bottom:14px;padding:4px 10px;border-radius:4px;background:rgba(0,0,0,.45);color:#fff;font:600 18px system-ui,'Noto Sans TC',sans-serif;letter-spacing:.05em">合成示範畫面</div>
+  <script type="module" src="render.js"></script>
+</body>
+</html>

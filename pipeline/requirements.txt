@@ -1,0 +1,8 @@
+# Python 3.10 – 3.12
+numpy>=1.24
+opencv-python>=4.8
+scipy>=1.10
+ultralytics>=8.3        # YOLO11 pose：偵測球員與 2D 關節（AGPL-3.0，商業用途請看 README 的授權說明）
+mediapipe>=0.10.14      # 3D 姿勢（Linux 伺服器可能要先 apt install libegl1）
+imageio-ffmpeg>=0.5     # 內附 ffmpeg，用來輸出網頁可播放的 MP4
+# 有 NVIDIA 顯卡：先照 https://pytorch.org 安裝 CUDA 版 PyTorch，再裝這份清單會快很多

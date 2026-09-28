@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0d1117">
+  <title>匹克球 3D 重建</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.min.js",
+        "three/addons/": "./vendor/addons/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <main id="stage">
+    <section id="view3d" class="panel" aria-label="3D 重建畫面">
+      <canvas id="canvas3d"></canvas>
+      <header class="hud">
+        <h1>匹克球 3D 重建 <span id="datasetTag" class="tag"></span></h1>
+        <p id="viewHint">環繞視角 · 拖曳旋轉、滾輪縮放</p>
+      </header>
+      <ul id="legend" class="legend"></ul>
+      <div id="message" class="message" hidden></div>
+    </section>
+    <section id="viewVideo" class="panel video-panel" aria-label="對照影片">
+      <video id="video" playsinline muted preload="auto"></video>
+      <div id="noVideo" class="no-video" hidden>
+        <p>沒有對照影片</p>
+        <p class="sub">把影片和 JSON 一起拖進視窗，或按右下角「開啟」。</p>
+      </div>
+    </section>
+  </main>
+
+  <footer id="bar">
+    <div class="grp grp-play">
+      <button id="btnPlay" type="button" title="播放／暫停（空白鍵）">■ 暫停</button>
+      <button id="btnPrev" type="button" title="上一格（←）">‹ 格</button>
+      <button id="btnNext" type="button" title="下一格（→）">格 ›</button>
+    </div>
+    <input id="timeline" type="range" min="0" max="0" step="1" value="0" aria-label="時間軸">
+    <div class="grp grp-info">
+      <span id="timecode" class="timecode">0.00 s · #0</span>
+    </div>
+    <div class="grp grp-speed">
+      <span class="lbl">速度</span>
+      <button type="button" data-speed="0.25">¼×</button>
+      <button type="button" data-speed="0.5">½×</button>
+      <button type="button" data-speed="1" class="active">1×</button>
+    </div>
+    <div class="grp grp-views">
+      <span class="lbl">視角</span>
+      <button type="button" data-view="orbit" class="active">環繞</button>
+      <button type="button" data-view="overlay">原機位疊合</button>
+      <button type="button" data-view="top">俯視</button>
+      <button type="button" data-view="behind">底線後方</button>
+      <button type="button" data-view="side">側面</button>
+    </div>
+    <div class="grp grp-toggles">
+      <button id="btnTrails" type="button" class="toggle active" title="軌跡（T）">軌跡</button>
+      <button id="btnVideo" type="button" class="toggle active" title="對照影片（V）">對照影片</button>
+      <button id="btnOpen" type="button" title="開啟 JSON／影片檔">開啟</button>
+      <select id="datasetSelect" aria-label="選擇資料" hidden></select>
+    </div>
+    <input id="fileInput" type="file" accept=".json,application/json,video/*" multiple hidden>
+  </footer>
+
+  <div id="dropHint" class="drop-hint" hidden>放開以載入 JSON／影片</div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

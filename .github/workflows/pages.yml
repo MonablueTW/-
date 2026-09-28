@@ -1,0 +1,49 @@
+# 把 web/ 資料夾發佈到 GitHub Pages（只從預設分支發佈）。
+# 第一次使用：到 GitHub 的 Settings → Pages → Build and deployment → Source 選「GitHub Actions」，
+# 再到 Actions 分頁手動執行一次這個 workflow（之後每次推送 web/ 的修改都會自動更新網站）。
+name: Deploy website to GitHub Pages
+
+on:
+  push:
+    paths: ["web/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check that GitHub Pages is enabled
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${{ github.repository }}/pages" > /dev/null 2>&1; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub Pages 尚未啟用：Settings → Pages → Source 選 GitHub Actions 後再執行一次。"
+          fi
+      - if: steps.pages.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+      - if: steps.pages.outputs.enabled == 'true'
+        uses: actions/configure-pages@v5
+      - if: steps.pages.outputs.enabled == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+      - if: steps.pages.outputs.enabled == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4

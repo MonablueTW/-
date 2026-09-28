@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# pipeline 產生的東西
+*.pt
+*.pk3d.pkl
+*_preview.jpg
+
+# Node
+node_modules/
+
+# 系統檔
+.DS_Store
+Thumbs.db
